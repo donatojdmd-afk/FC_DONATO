@@ -1,0 +1,219 @@
+/**
+ * PUENTE GEMINI → FLUJO DE CAJA JDMD
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Qué hace
+ *   Cada minuto revisa tu Google Tasks. Toda tarea cuyo título empiece por "Caja"
+ *   (y todo lo que escribas en la lista "Flujo de caja") se envía a tu app como un
+ *   movimiento y la tarea queda marcada como completada, con una nota de lo que se guardó.
+ *
+ * Cómo se usa con Gemini (después de instalar)
+ *   Dile a Gemini:  "Crea una tarea: caja gasto 25 mil almuerzo"
+ *   Otros ejemplos: "caja ingreso 2.600.000 nómina bancolombia"
+ *                   "caja pérdida 80 mil se me perdió un billete"
+ *                   "caja inversión 500 mil CDT"
+ *                   "caja fondo de ahorro 300 mil"   ·   "caja fondo de emergencia 250 mil"
+ *                   "caja pagué 320 mil tarjeta de crédito"
+ *   Puedes decir la cuenta (nequi, bancolombia, efectivo…) y la fecha (ayer, el 5 de noviembre).
+ *
+ * INSTALACIÓN (una sola vez, desde un computador)
+ *   1. Entra a https://script.google.com y pulsa "Nuevo proyecto".
+ *      Borra lo que aparezca y pega TODO este archivo. Guarda (icono del disquete).
+ *   2. A la izquierda, junto a "Servicios", pulsa +  →  elige "Google Tasks API"  →  Agregar.
+ *   3. Arriba, en el selector de funciones elige "instalar" y pulsa "Ejecutar".
+ *      Google pedirá permisos: elige tu cuenta → "Configuración avanzada" → "Ir a (nombre del proyecto)" → Permitir.
+ *   4. Abajo, en "Registro de ejecución", aparecerá un CÓDIGO DE VINCULACIÓN de 8 letras.
+ *      Escríbelo en tu app, en la sección "Gemini" → "Activar enlace" (o envíaselo a Claude). Vence en 24 horas.
+ *   Listo: cuando el código esté aprobado, el puente empieza a funcionar solo.
+ *
+ * Seguridad
+ *   · Este script crea su propia clave y la guarda solo aquí (Propiedades del script). Nadie más la ve.
+ *   · Con esa clave solo se pueden AGREGAR movimientos a tu app: no se puede leer, cambiar ni borrar nada.
+ *   · Para apagarlo: ejecuta "desinstalar".
+ */
+
+const PUENTE_URL = 'https://ptmokhcsxrdsqgujzhca.supabase.co/functions/v1/puente-gemini';
+const PALABRA_CLAVE = 'caja';            // las tareas que empiezan por esta palabra se registran
+const LISTA_DIRECTA = 'Flujo de caja';   // en esta lista no hace falta la palabra clave
+const ZONA = 'America/Bogota';
+const MARCA_OK = '✓ Flujo de Caja: ';
+const MARCA_AVISO = '⚠ Flujo de Caja: ';
+
+/** Paso 3 de la instalación. Se puede ejecutar de nuevo sin problema. */
+function instalar() {
+  const p = PropertiesService.getScriptProperties();
+  let clave = p.getProperty('CLAVE');
+  if (!clave) {
+    clave = (Utilities.getUuid() + Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+    p.setProperty('CLAVE', clave);
+  }
+  let listas;
+  try { listas = Tasks.Tasklists.list({ maxResults: 100 }).items || []; }
+  catch (e) { throw new Error('Falta activar el servicio "Google Tasks API" (paso 2 de la instalación). Detalle: ' + e.message); }
+  if (!listas.some(function (l) { return iguales_(l.title, LISTA_DIRECTA); })) Tasks.Tasklists.insert({ title: LISTA_DIRECTA });
+
+  // Solo se toman en cuenta las tareas creadas o cambiadas desde ahora: las viejas no se tocan.
+  if (!p.getProperty('DESDE')) p.setProperty('DESDE', new Date().toISOString());
+
+  ScriptApp.getProjectTriggers()
+    .filter(function (t) { return t.getHandlerFunction() === 'revisar'; })
+    .forEach(function (t) { ScriptApp.deleteTrigger(t); });
+  ScriptApp.newTrigger('revisar').timeBased().everyMinutes(1).create();
+
+  const r = llamar_({ accion: 'vincular', clave_hash: huella_(clave), nombre: 'Google Tasks' }, null);
+  if (!r.ok) throw new Error('No se pudo solicitar la vinculación: ' + (r.error || ('respuesta ' + r.http)));
+  if (r.estado === 'activa') {
+    p.setProperty('ESTADO', 'activa');
+    console.log('✅ El enlace ya está ACTIVO. Prueba diciéndole a Gemini: "Crea una tarea: caja gasto 5 mil prueba".');
+  } else if (r.estado === 'revocada') {
+    console.log('⛔ Este enlace fue desactivado. Para crear uno nuevo ejecuta "reiniciar" y luego "instalar".');
+  } else {
+    p.deleteProperty('ESTADO');
+    p.deleteProperty('ESPERAS');
+    const c = String(r.codigo || '');
+    console.log('══════════════════════════════════════════════');
+    console.log('  CÓDIGO DE VINCULACIÓN:  ' + c.slice(0, 4) + '-' + c.slice(4));
+    console.log('  Escríbelo en tu app: sección Gemini → Activar enlace (vence en 24 horas).');
+    console.log('══════════════════════════════════════════════');
+  }
+}
+
+/** Se ejecuta sola cada minuto. */
+function revisar() {
+  const candado = LockService.getScriptLock();
+  if (!candado.tryLock(500)) return;
+  try {
+    const p = PropertiesService.getScriptProperties();
+    const clave = p.getProperty('CLAVE');
+    if (!clave) return;
+
+    if (p.getProperty('ESTADO') !== 'activa') {
+      // Mientras el código no esté aprobado se consulta cada minuto la primera hora y luego cada 15 minutos.
+      const n = Number(p.getProperty('ESPERAS') || 0) + 1;
+      p.setProperty('ESPERAS', String(n));
+      if (n > 60 && n % 15 !== 0) return;
+      const e = llamar_({ accion: 'estado' }, clave);
+      if (!e.ok) return;
+      p.setProperty('ESTADO', 'activa');
+      p.deleteProperty('ESPERAS');
+    }
+
+    const inicio = new Date();
+    const hoy = Utilities.formatDate(inicio, ZONA, 'yyyy-MM-dd');
+    const desde = p.getProperty('DESDE');
+    let fallidas = {};
+    try { fallidas = JSON.parse(p.getProperty('FALLIDAS') || '{}'); } catch (e) { fallidas = {}; }
+    const reClave = new RegExp('^\\s*(flujo de )?' + PALABRA_CLAVE + '(?![a-záéíóúñ0-9])', 'i');
+    let reintentar = false, cambioFallidas = false;
+
+    const listas = Tasks.Tasklists.list({ maxResults: 100 }).items || [];
+    for (let i = 0; i < listas.length; i++) {
+      const lista = listas[i];
+      const directa = iguales_(lista.title, LISTA_DIRECTA);
+      let pagina = null;
+      do {
+        const params = { showCompleted: false, showHidden: false, maxResults: 100 };
+        if (desde) params.updatedMin = desde;
+        if (pagina) params.pageToken = pagina;
+        const res = Tasks.Tasks.list(lista.id, params);
+        const tareas = res.items || [];
+        for (let k = 0; k < tareas.length; k++) {
+          const t = tareas[k];
+          const titulo = String(t.title || '').trim();
+          if (!titulo || t.status === 'completed') continue;
+          if (!directa && !reClave.test(titulo)) continue;
+          if (fallidas[t.id] === titulo) continue;               // ya se avisó y el título no ha cambiado
+          if (new Date() - inicio > 40000) { reintentar = true; break; }
+
+          const notasPropias = limpiarNotas_(t.notes);
+          const cuerpo = { accion: 'registrar', texto: titulo, notas: notasPropias, ref: t.id, fecha_base: hoy };
+          if (t.due) cuerpo.fecha = String(t.due).slice(0, 10);
+          const r = llamar_(cuerpo, clave);
+
+          if (r.ok) {
+            Tasks.Tasks.patch({ status: 'completed', notes: MARCA_OK + r.resumen + (notasPropias ? '\n' + notasPropias : '') }, lista.id, t.id);
+            if (fallidas[t.id]) { delete fallidas[t.id]; cambioFallidas = true; }
+            console.log('Registrado → ' + r.resumen);
+          } else if (r.http === 422) {
+            Tasks.Tasks.patch({ notes: MARCA_AVISO + (r.error || 'No se pudo interpretar.') + ' Corrige el título y se intenta de nuevo.' + (notasPropias ? '\n' + notasPropias : '') }, lista.id, t.id);
+            fallidas[t.id] = titulo; cambioFallidas = true;
+            console.log('No se entendió → "' + titulo + '": ' + r.error);
+          } else if (r.http === 401 || r.http === 403) {
+            p.deleteProperty('ESTADO');
+            console.log('El enlace no está activo: ' + (r.error || r.http));
+            return;
+          } else {
+            reintentar = true;                                    // fallo pasajero: se intenta en la próxima pasada
+            console.log('Fallo pasajero (' + r.http + '): ' + (r.error || ''));
+          }
+        }
+        pagina = reintentar ? null : res.nextPageToken;
+      } while (pagina);
+    }
+
+    if (cambioFallidas) {
+      const ids = Object.keys(fallidas);
+      if (ids.length > 40) ids.slice(0, ids.length - 40).forEach(function (id) { delete fallidas[id]; });
+      p.setProperty('FALLIDAS', JSON.stringify(fallidas));
+    }
+    if (!reintentar) p.setProperty('DESDE', new Date(inicio.getTime() - 120000).toISOString());
+  } finally {
+    candado.releaseLock();
+  }
+}
+
+/** Muestra si el enlace está activo y cómo se entenderían algunas frases. No guarda nada. */
+function probar() {
+  const p = PropertiesService.getScriptProperties();
+  const clave = p.getProperty('CLAVE');
+  if (!clave) { console.log('Aún no has ejecutado "instalar".'); return; }
+  const e = llamar_({ accion: 'estado' }, clave);
+  console.log(e.ok ? '✅ Enlace ACTIVO.' : ('Enlace no activo: ' + (e.error || e.http) + (e.codigo ? '  ·  Código: ' + e.codigo.slice(0, 4) + '-' + e.codigo.slice(4) : '')));
+  const hay = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'revisar'; });
+  console.log(hay ? '✅ Revisión automática cada minuto: encendida.' : '⚠ La revisión automática está apagada. Ejecuta "instalar".');
+  ['caja gasto 25 mil almuerzo', 'caja ingreso 2.600.000 nómina bancolombia', 'caja pérdida 80 mil se me perdió un billete', 'caja inversión 500 mil CDT'].forEach(function (frase) {
+    let j = {};
+    try { j = JSON.parse(UrlFetchApp.fetch(PUENTE_URL + '?probar=' + encodeURIComponent(frase), { muteHttpExceptions: true }).getContentText()); } catch (err) { j = { mensaje: err.message }; }
+    console.log('"' + frase + '"  →  ' + (j.ok ? j.resumen : ('no se entendió: ' + j.mensaje)));
+  });
+}
+
+/** Apaga la revisión automática. La clave se conserva: con "instalar" se vuelve a encender. */
+function desinstalar() {
+  ScriptApp.getProjectTriggers()
+    .filter(function (t) { return t.getHandlerFunction() === 'revisar'; })
+    .forEach(function (t) { ScriptApp.deleteTrigger(t); });
+  console.log('Revisión automática apagada.');
+}
+
+/** Olvida la clave actual. Úsalo solo si el enlace fue desactivado y quieres vincular de nuevo. */
+function reiniciar() {
+  desinstalar();
+  PropertiesService.getScriptProperties().deleteAllProperties();
+  console.log('Clave olvidada. Ejecuta "instalar" para crear un enlace nuevo.');
+}
+
+/* ───────────── utilidades internas ───────────── */
+function iguales_(a, b) { return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase(); }
+
+function limpiarNotas_(notas) {
+  return String(notas || '').split('\n')
+    .filter(function (l) { return l.indexOf(MARCA_OK) !== 0 && l.indexOf(MARCA_AVISO) !== 0; })
+    .join('\n').trim();
+}
+
+function huella_(texto) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, texto, Utilities.Charset.UTF_8)
+    .map(function (b) { return ('0' + ((b + 256) % 256).toString(16)).slice(-2); }).join('');
+}
+
+function llamar_(cuerpo, clave) {
+  const opciones = { method: 'post', contentType: 'application/json', payload: JSON.stringify(cuerpo), muteHttpExceptions: true, headers: clave ? { 'x-puente-clave': clave } : {} };
+  let resp;
+  try { resp = UrlFetchApp.fetch(PUENTE_URL, opciones); }
+  catch (e) { return { ok: false, http: 0, error: 'Sin conexión: ' + e.message }; }
+  let j = {};
+  try { j = JSON.parse(resp.getContentText()) || {}; } catch (e) { j = {}; }
+  j.http = resp.getResponseCode();
+  if (j.ok !== true) j.ok = false;
+  return j;
+}
